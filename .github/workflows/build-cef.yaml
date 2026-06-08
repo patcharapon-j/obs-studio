@@ -1,0 +1,157 @@
+name: Build CEF
+# Builds OBS's *patched* Chromium Embedded Framework for every platform OBS
+# ships, publishes the distributions to a `cef-<version>` GitHub Release on this
+# fork, and rewrites the cef.hashes block in CMakePresets.json to match.
+#
+# WARNING: A full Chromium build needs ~100+ GB free disk, 32+ GB RAM and
+# several hours per target. The GitHub-hosted runners below are a convenience
+# default and will likely hit the 6h job limit or run out of disk -- point the
+# matrix at large/self-hosted runners for real builds. See
+# docs/development/cef-update-runbook.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cef_branch:
+        description: "CEF/Chromium branch number (e.g. 7204 = Chromium 138 LTS)"
+        required: true
+        default: "7204"
+      cef_repo_url:
+        description: "Patched CEF fork git URL (carries OBS shared-texture patches)"
+        required: true
+        default: "https://github.com/patcharapon-j/cef.git"
+      cef_repo_branch:
+        description: "Branch in the patched CEF fork to build"
+        required: true
+        default: "7204-shared-textures-and-fixes"
+      revision:
+        description: "Artifact revision suffix (v<N>)"
+        required: true
+        default: "1"
+      update_presets:
+        description: "Commit refreshed cef.hashes to CMakePresets.json on this branch"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build CEF (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-24.04
+            shell: bash
+            script: linux
+            target_arch: x86_64
+          - name: linux-aarch64       # cross-compiled on x86_64
+            runs-on: ubuntu-24.04
+            shell: bash
+            script: linux
+            target_arch: aarch64
+          - name: macos-arm64
+            runs-on: macos-14
+            shell: bash
+            script: macos
+            target_arch: arm64
+          - name: macos-x86_64        # cross-compiled on arm64 host
+            runs-on: macos-14
+            shell: bash
+            script: macos
+            target_arch: x86_64
+          - name: windows-x64
+            runs-on: windows-2022
+            shell: pwsh
+            script: windows
+            target_arch: x64
+          - name: windows-arm64       # cross-compiled on x64
+            runs-on: windows-2022
+            shell: pwsh
+            script: windows
+            target_arch: arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build CEF (POSIX) 🏗️
+        if: matrix.shell == 'bash'
+        env:
+          CEF_BRANCH: ${{ inputs.cef_branch }}
+          CEF_REPO_URL: ${{ inputs.cef_repo_url }}
+          CEF_REPO_BRANCH: ${{ inputs.cef_repo_branch }}
+          CEF_REVISION: ${{ inputs.revision }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
+          OUTPUT_DIR: ${{ github.workspace }}/cef-artifacts
+        run: |
+          chmod +x .github/scripts/cef/build-cef.sh
+          .github/scripts/cef/build-cef.sh
+
+      - name: Build CEF (Windows) 🏗️
+        if: matrix.shell == 'pwsh'
+        env:
+          OUTPUT_DIR: ${{ github.workspace }}/cef-artifacts
+        run: |
+          .github/scripts/cef/Build-CEF.ps1 `
+            -CefBranch '${{ inputs.cef_branch }}' `
+            -CefRepoUrl '${{ inputs.cef_repo_url }}' `
+            -CefRepoBranch '${{ inputs.cef_repo_branch }}' `
+            -TargetArch '${{ matrix.target_arch }}' `
+            -CefRevision ${{ inputs.revision }}
+
+      - name: Upload artifact ⬆️
+        uses: actions/upload-artifact@v4
+        with:
+          name: cef-${{ matrix.name }}
+          path: cef-artifacts/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish Release & Update Presets
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts ⬇️
+        uses: actions/download-artifact@v4
+        with:
+          path: cef-artifacts
+          merge-multiple: true
+
+      - name: Create / update the cef release 📦
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: cef-${{ inputs.cef_branch }}
+        run: |
+          : List artifacts
+          ls -l cef-artifacts
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --title "Chromium Embedded Framework ${{ inputs.cef_branch }}" \
+              --notes "OBS-patched CEF build ${{ inputs.cef_branch }} (rev v${{ inputs.revision }})." \
+              --prerelease
+          fi
+          gh release upload "${TAG}" cef-artifacts/cef_binary_*.tar.xz cef-artifacts/cef_binary_*.zip \
+            --clobber
+
+      - name: Refresh CMakePresets.json hashes 🔑
+        if: ${{ inputs.update_presets }}
+        run: python3 .github/scripts/cef/update-cef-hashes.py --artifacts cef-artifacts
+
+      - name: Commit updated hashes 📝
+        if: ${{ inputs.update_presets }}
+        run: |
+          if git diff --quiet -- CMakePresets.json; then
+            echo "No hash changes to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CMakePresets.json
+          git commit -m "cmake: Update CEF ${{ inputs.cef_branch }} dependency hashes"
+          git push origin HEAD:${{ github.ref_name }}
